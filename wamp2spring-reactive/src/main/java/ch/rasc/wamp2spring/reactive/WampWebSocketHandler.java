@@ -19,10 +19,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
+import java.security.Principal;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -31,6 +29,7 @@ import org.apache.commons.logging.LogFactory;
 import org.reactivestreams.Publisher;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.ApplicationEventPublisherAware;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.messaging.Message;
 import org.springframework.messaging.MessageChannel;
 import org.springframework.web.reactive.socket.CloseStatus;
@@ -61,7 +60,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 public class WampWebSocketHandler
-		implements WebSocketHandler, ApplicationEventPublisherAware {
+		implements WebSocketHandler, ApplicationEventPublisherAware, SmartLifecycle {
 
 	private static final Log logger = LogFactory.getLog(WampWebSocketHandler.class);
 
@@ -93,6 +92,7 @@ public class WampWebSocketHandler
 	private final MessageChannel clientOutboundChannel;
 
 	private ApplicationEventPublisher applicationEventPublisher;
+	private volatile boolean isRunning = false;
 
 	public WampWebSocketHandler(JsonFactory jsonFactory, JsonFactory msgpackFactory,
 			JsonFactory cborFactory, JsonFactory smileFactory,
@@ -125,33 +125,55 @@ public class WampWebSocketHandler
 	}
 
 	@Override
+	public void start() {
+		this.isRunning = true;
+	}
+
+	@Override
+	public void stop() {
+		this.isRunning = false;
+		Mono.when(activeSessions.stream().map(WebSocketSession::close).toList()).subscribe();
+	}
+
+	@Override
+	public boolean isRunning() {
+		return this.isRunning;
+	}
+
+	@Override
 	public List<String> getSubProtocols() {
 		return supportedProtocols;
 	}
 
+	private final Set<WebSocketSession> activeSessions = ConcurrentHashMap.newKeySet();
+
 	@Override
 	public Mono<Void> handle(WebSocketSession session) {
-		session.receive().doFinally(sig -> {
-			Long wampSessionId = this.webSocketId2WampSessionId.get(session.getId());
-			if (wampSessionId != null) {
-				this.applicationEventPublisher.publishEvent(
-						new WampDisconnectEvent(wampSessionId, session.getId(),
-								session.getHandshakeInfo().getPrincipal().block()));
-				this.webSocketId2WampSessionId.remove(session.getId());
-			}
-			session.close(); // ?
-		}).subscribe(inMsg -> {
-			handleIncomingMessage(inMsg, session);
-		});
+		if (!this.isRunning) {
+			return session.close(CloseStatus.NOT_ACCEPTABLE);
+		}
+		activeSessions.add(session);
+		return session.getHandshakeInfo().getPrincipal().flatMap(principal -> {
+			Publisher<Message<Object>> publisher = MessageChannelReactiveUtils.toPublisher(this.clientOutboundChannel);
 
-		Publisher<Message<Object>> publisher = MessageChannelReactiveUtils
-				.toPublisher(this.clientOutboundChannel);
-		return session.send(Flux.from(publisher)
+			return session.send(Flux.from(publisher)
 				.filter(msg -> resolveSessionId(msg).equals(session.getId()))
-				.map(msg -> handleOutgoingMessage(msg, session)));
+				.map(msg -> handleOutgoingMessage(msg, session)))
+				.and(session.receive().map(inMsg -> {
+					handleIncomingMessage(inMsg, session, principal);
+					return Mono.empty();
+				})).doFinally(sig -> {
+					activeSessions.remove(session);
+					Long wampSessionId = this.webSocketId2WampSessionId.get(session.getId());
+					if (wampSessionId != null) {
+						this.applicationEventPublisher.publishEvent(new WampDisconnectEvent(wampSessionId, session.getId(), principal));
+						this.webSocketId2WampSessionId.remove(session.getId());
+					}
+				});
+		});
 	}
 
-	public void handleIncomingMessage(WebSocketMessage inMsg, WebSocketSession session) {
+	public void handleIncomingMessage(WebSocketMessage inMsg, WebSocketSession session, Principal principal) {
 
 		try {
 			WampMessage wampMessage = null;
@@ -201,8 +223,7 @@ public class WampWebSocketHandler
 
 			wampMessage.setHeader(WampMessageHeader.WEBSOCKET_SESSION_ID,
 					session.getId());
-			wampMessage.setHeader(WampMessageHeader.PRINCIPAL,
-					session.getHandshakeInfo().getPrincipal().block());
+			wampMessage.setHeader(WampMessageHeader.PRINCIPAL, principal);
 			wampMessage.setHeader(WampMessageHeader.WAMP_SESSION_ID,
 					this.webSocketId2WampSessionId.get(session.getId()));
 

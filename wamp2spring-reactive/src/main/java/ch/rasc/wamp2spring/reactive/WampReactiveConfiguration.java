@@ -20,6 +20,7 @@ import java.util.Map;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.context.annotation.ImportAware;
 import org.springframework.core.type.AnnotationMetadata;
 import org.springframework.web.reactive.HandlerMapping;
@@ -40,6 +41,7 @@ public class WampReactiveConfiguration extends WampConfiguration implements Impo
 		super.setImportMetadata(importMetadata, EnableReactiveWamp.class.getName());
 	}
 
+	@DependsOn("webSocketService")
 	@Bean
 	public WampWebSocketHandler wampWebSocketHandler() {
 		return new WampWebSocketHandler(jsonJsonFactory(), msgpackJsonFactory(),
